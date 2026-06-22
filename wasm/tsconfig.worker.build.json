@@ -9,7 +9,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "skipLibCheck": true,
-    "ignoreDeprecations": "6.0",
+    "ignoreDeprecations": "5.0",
     "sourceMap": false
   },
   "files": ["runtime.ts", "pre.ts", "runtime.d.ts", "common.d.ts"]
