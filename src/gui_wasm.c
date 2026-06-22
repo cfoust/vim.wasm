@@ -1599,7 +1599,21 @@ gui_mch_insert_lines(int row, int num_lines)
 void
 clip_mch_request_selection(Clipboard_T *cbd)
 {
-    // TODO: Clipboard support
+    char_u *text;
+
+    if (!clipboard_available)
+	return;
+
+    // vimwasm_read_clipboard() returns a malloc'd UTF-8 C string (or NULL)
+    // obtained from the JavaScript runtime (the system clipboard).
+    text = (char_u *)vimwasm_read_clipboard();
+    if (text == NULL)
+	return;
+
+    // Foreign clipboard data has no type info; treat it as charwise, matching
+    // how the '*' register read path stores it.
+    clip_yank_selection(MCHAR, text, (long)STRLEN(text), cbd);
+    free((char *)text);
 }
 
 /*
