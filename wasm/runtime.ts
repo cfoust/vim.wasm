@@ -20,7 +20,7 @@ declare interface VimWasmRuntime {
     vimStarted(): void;
     waitAndHandleEventFromMain(timeout: number | undefined): number;
     exportFile(fullpath: string): boolean;
-    readClipboard(): CharPtr;
+    readClipboard(): Promise<CharPtr>;
     writeClipboard(text: string): void;
     setTitle(title: string): void;
     evalJS(file: string): number;
@@ -159,6 +159,8 @@ const VimWasmLibrary = {
                 // awaited vimwasm_wait_for_event().
                 private eventPending: boolean;
                 private inputSignal: (() => void) | null;
+                // Resolver for an in-flight async clipboard read (paste).
+                private clipboardSignal: ((text: string | null) => void) | null;
 
                 constructor() {
                     onmessage = e => this.onMessage(e.data);
@@ -171,6 +173,7 @@ const VimWasmLibrary = {
                     this.buffer = new Int32Array(); // All members must be initialized (required by TypeScript compiler)
                     this.eventPending = false;
                     this.inputSignal = null;
+                    this.clipboardSignal = null;
                 }
 
                 draw(...event: DrawEventMessage) {
@@ -216,6 +219,15 @@ const VimWasmLibrary = {
                             this.domHeight = msg.height;
                             guiWasmResizeShell(msg.width, msg.height);
                             this.signalEvent();
+                            return;
+                        case 'clipboard-text':
+                            // response to a read-clipboard:request; resolves the
+                            // awaited vimwasm_read_clipboard() (Asyncify).
+                            if (this.clipboardSignal !== null) {
+                                const resolve = this.clipboardSignal;
+                                this.clipboardSignal = null;
+                                resolve(typeof msg.text === 'string' ? msg.text : null);
+                            }
                             return;
                         case 'cmdline': {
                             const success = guiWasmDoCmdline(msg.cmdline);
@@ -271,10 +283,11 @@ const VimWasmLibrary = {
 
                     const willPrepare = this.prepareFileSystem(msg.persistent, msg.dirs, msg.files, msg.fetchFiles);
 
-                    // System clipboard read requires a synchronous round-trip to the
-                    // main thread, which the non-SAB build does not support. Disable
-                    // it; Vim's internal registers still work.
-                    guiWasmSetClipAvail(false);
+                    // Clipboard read/write go through the main thread: write is
+                    // fire-and-forget, read is an async (Asyncify) round-trip.
+                    if (!msg.clipboard) {
+                        guiWasmSetClipAvail(false);
+                    }
 
                     return willPrepare.then(() => this.main(msg.cmdArgs));
                 }
@@ -320,37 +333,30 @@ const VimWasmLibrary = {
                     }
                 }
 
-                readClipboard(): CharPtr {
+                // Async (Asyncify): ask the main thread for the system clipboard
+                // text via postMessage and await the 'clipboard-text' reply, then
+                // return a malloc'd C string. Replaces the old SharedArrayBuffer
+                // round-trip. Resolves to NULL on failure (Vim shows empty).
+                readClipboard(): Promise<CharPtr> {
                     this.sendMessage({ kind: 'read-clipboard:request' });
-
-                    // Note: While waiting for this status, STATUS_REQUEST_SHARED_BUF event is handled once
-                    // because main thread requests a new shared array buffer for seding clipboard text to
-                    // worker thread.
-                    // If extracting clipboard text failed, a new shared buffer is not created and this status
-                    // is immediately sent from main thread.
-                    this.waitUntilStatus(STATUS_NOTIFY_CLIPBOARD_WRITE_COMPLETE);
-                    const isError = !!this.buffer[1];
-                    const bufId = this.buffer[2];
-                    this.receiveDone(STATUS_NOTIFY_CLIPBOARD_WRITE_COMPLETE);
-
-                    if (isError) {
-                        guiWasmSetClipAvail(false);
-                        return NULL;
-                    }
-
-                    const buffer = this.sharedBufs.takeBuffer(STATUS_NOTIFY_CLIPBOARD_WRITE_COMPLETE, bufId);
-                    const arr = new Uint8Array(buffer);
-                    arr[arr.byteLength - 1] = 0; // Write '\0'
-
-                    const ptr = Module._malloc(arr.byteLength);
-                    if (ptr === NULL) {
-                        return NULL;
-                    }
-                    Module.HEAPU8.set(arr, ptr as number);
-
-                    debug('Malloced', arr.byteLength, 'bytes and wrote clipboard text');
-
-                    return ptr;
+                    return new Promise<CharPtr>(resolve => {
+                        this.clipboardSignal = (text: string | null) => {
+                            this.clipboardSignal = null;
+                            if (text === null) {
+                                resolve(NULL);
+                                return;
+                            }
+                            const arr = new TextEncoder().encode(text);
+                            const ptr = Module._malloc(arr.byteLength + 1);
+                            if (ptr === NULL) {
+                                resolve(NULL);
+                                return;
+                            }
+                            Module.HEAPU8.set(arr, ptr as number);
+                            Module.HEAPU8[(ptr as number) + arr.byteLength] = 0; // NUL terminate
+                            resolve(ptr);
+                        };
+                    });
                 }
 
                 writeClipboard(text: string) {
@@ -992,8 +998,13 @@ const VimWasmLibrary = {
     },
 
     // char *vimwasm_read_clipboard();
+    // Async (Asyncify): suspends while the main thread reads the system clipboard.
+    // Must be listed in ASYNCIFY_IMPORTS at link time.
+    vimwasm_read_clipboard__deps: ['$Asyncify'],
     vimwasm_read_clipboard() {
-        return VW.runtime.readClipboard();
+        return Asyncify.handleAsync(function () {
+            return VW.runtime.readClipboard();
+        });
     },
 
     // void vimwasm_write_clipboard(char *);

@@ -142,6 +142,12 @@ export class VimWorker {
         this.worker.postMessage({ kind: 'resize', width, height });
     }
 
+    // Reply to a read-clipboard:request with the system clipboard text (or null
+    // on failure). Resolves the worker's awaited vimwasm_read_clipboard().
+    sendClipboardText(text: string | null) {
+        this.worker.postMessage({ kind: 'clipboard-text', text });
+    }
+
     async requestSharedBuffer(byteLength: number): Promise<[number, SharedArrayBuffer]> {
         this.enqueueEvent(STATUS_REQUEST_SHARED_BUF, byteLength);
 
@@ -1007,14 +1013,14 @@ export class VimWasm {
             case 'read-clipboard:request':
                 if (this.readClipboard) {
                     this.readClipboard()
-                        .then(text => this.worker.responseClipboardText(text))
+                        .then(text => this.worker.sendClipboardText(text))
                         .catch(err => {
                             debug('Cannot read clipboard:', err);
-                            this.worker.notifyClipboardError();
+                            this.worker.sendClipboardText(null);
                         });
                 } else {
                     debug('Cannot read clipboard because VimWasm.readClipboard is not set');
-                    this.worker.notifyClipboardError();
+                    this.worker.sendClipboardText(null);
                 }
                 break;
             case 'write-clipboard':
