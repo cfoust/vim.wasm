@@ -80,17 +80,12 @@ function statusName(s: EventStatusFromMain): string {
 }
 
 export function checkBrowserCompatibility(): string | undefined {
-    function notSupported(feat: string): string {
-        return `${feat} is not supported by this browser. If you're using Firefox or Safari, please enable feature flag.`;
+    // The Asyncify build does not use SharedArrayBuffer/Atomics, so it runs in
+    // any context (no cross-origin isolation required). Only a Worker and
+    // WebAssembly are needed, which are universally available.
+    if (typeof WebAssembly === 'undefined') {
+        return "WebAssembly is not supported by this browser.";
     }
-
-    if (typeof SharedArrayBuffer === 'undefined') {
-        return notSupported('SharedArrayBuffer');
-    }
-    if (typeof Atomics === 'undefined') {
-        return notSupported('Atomics API');
-    }
-
     return undefined;
 }
 
@@ -110,7 +105,9 @@ export class VimWorker {
         this.worker = new Worker(scriptPath);
         this.worker.onmessage = this.recvMessage.bind(this);
         this.worker.onerror = this.recvError.bind(this);
-        this.sharedBuffer = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 128));
+        // Asyncify build: no SharedArrayBuffer. Kept as an empty array so existing
+        // field references stay valid; it is never used for communication.
+        this.sharedBuffer = new Int32Array(0);
         this.onMessage = onMessage;
         this.onError = onError;
         this.onOneshotMessage = new Map();
@@ -138,11 +135,11 @@ export class VimWorker {
     }
 
     notifyKeyEvent(key: string, keyCode: number, ctrl: boolean, shift: boolean, alt: boolean, meta: boolean) {
-        this.enqueueEvent(STATUS_NOTIFY_KEY, keyCode, ctrl, shift, alt, meta, key);
+        this.worker.postMessage({ kind: 'key', key, keyCode, ctrl, shift, alt, meta });
     }
 
     notifyResizeEvent(width: number, height: number) {
-        this.enqueueEvent(STATUS_NOTIFY_RESIZE, width, height);
+        this.worker.postMessage({ kind: 'resize', width, height });
     }
 
     async requestSharedBuffer(byteLength: number): Promise<[number, SharedArrayBuffer]> {
@@ -179,7 +176,7 @@ export class VimWorker {
             throw new Error('Specified command line is empty');
         }
 
-        this.enqueueEvent(STATUS_REQUEST_CMDLINE, cmdline);
+        this.worker.postMessage({ kind: 'cmdline', cmdline });
 
         const msg = (await this.waitForOneshotMessage('cmdline:response')) as CmdlineResultFromWorker;
         debug('Result of command', cmdline, ':', msg.success);
@@ -189,12 +186,9 @@ export class VimWorker {
     }
 
     async notifyErrorOutput(message: string) {
-        const encoded = new TextEncoder().encode(message);
-        const [bufId, buffer] = await this.requestSharedBuffer(encoded.byteLength);
-        new Uint8Array(buffer).set(encoded);
-
-        this.enqueueEvent(STATUS_NOTIFY_ERROR_OUTPUT, bufId);
-        debug('Sent error message output:', message);
+        // Asyncify build: no shared buffer to ferry the message into Vim's :echoerr.
+        // Surface it to the console instead.
+        console.error('vim.wasm:', message); // eslint-disable-line no-console
     }
 
     async notifyEvalFuncRet(ret: string) {

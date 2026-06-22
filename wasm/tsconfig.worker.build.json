@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "none",
+    "target": "es5",
+    "lib": ["es2017", "webworker"],
+    "types": [],
+    "noEmitOnError": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
+    "sourceMap": false
+  },
+  "files": ["runtime.ts", "pre.ts", "runtime.d.ts", "common.d.ts"]
+}

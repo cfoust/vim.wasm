@@ -29,6 +29,9 @@ declare const Module: {
 };
 
 declare const LibraryManager: any;
+// Provided by emscripten when built with -sASYNCIFY. handleAsync() unwinds the
+// Wasm stack while the returned Promise is pending and rewinds with its value.
+declare const Asyncify: { handleAsync<T>(f: () => Promise<T>): T };
 declare function UTF8ToString(ptr: CharPtr, maxBytesToRead?: number): string;
 declare function stringToUTF8(str: string, outPtr: CharPtr, maxBytesToRead: number): number;
 declare function autoAddDeps(lib: object, name: string): void;

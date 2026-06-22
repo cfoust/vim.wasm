@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "target": "es2017",
+    "lib": ["es2017", "dom"],
+    "types": [],
+    "noEmitOnError": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "files": ["vimwasm.ts", "common.d.ts"]
+}

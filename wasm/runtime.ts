@@ -86,7 +86,7 @@ const VimWasmLibrary = {
             let guiWasmSetClipAvail: (a: boolean) => void;
             let guiWasmDoCmdline: (c: string) => boolean;
             let guiWasmEmsg: (m: string) => void;
-            let wasmMain: (c: number, v: number) => void;
+            let wasmMain: (c: number, v: number) => Promise<void>;
 
             // Setup C function bridges.
             // Since Module.cwrap() and Module.ccall() are set in runtime initialization, it must wait
@@ -109,10 +109,12 @@ const VimWasmLibrary = {
                     guiWasmSetClipAvail = Module.cwrap('gui_wasm_set_clip_avail', null, ['boolean' /* avail */]);
                     guiWasmDoCmdline = Module.cwrap('gui_wasm_do_cmdline', 'boolean', ['string' /* cmdline */]);
                     guiWasmEmsg = Module.cwrap('gui_wasm_emsg', null, ['string' /* msg */]);
+                    // async: true because the main loop suspends via Asyncify
+                    // (vimwasm_wait_for_event), so wasm_main() returns a Promise.
                     wasmMain = Module.cwrap('wasm_main', null, [
                         'number', // int argc
                         'number', // char **argv
-                    ]);
+                    ], { async: true });
                 })
                 .catch(console.error); // eslint-disable-line no-console
 
@@ -152,6 +154,11 @@ const VimWasmLibrary = {
                 private syncfsOnExit: boolean;
                 private started: boolean;
                 private readonly sharedBufs: SharedBuffers;
+                // Asyncify (no SharedArrayBuffer): input arrives via postMessage and
+                // is applied reentrantly while the main loop is suspended in an
+                // awaited vimwasm_wait_for_event().
+                private eventPending: boolean;
+                private inputSignal: (() => void) | null;
 
                 constructor() {
                     onmessage = e => this.onMessage(e.data);
@@ -162,6 +169,8 @@ const VimWasmLibrary = {
                     this.started = false;
                     this.sharedBufs = new SharedBuffers();
                     this.buffer = new Int32Array(); // All members must be initialized (required by TypeScript compiler)
+                    this.eventPending = false;
+                    this.inputSignal = null;
                 }
 
                 draw(...event: DrawEventMessage) {
@@ -180,11 +189,40 @@ const VimWasmLibrary = {
                     debug('Error was thrown in worker:', err);
                 }
 
-                onMessage(msg: StartMessageFromMain) {
+                // Input events from the main thread. They are applied reentrantly
+                // (Vim is suspended inside an awaited vimwasm_wait_for_event(), so
+                // its Asyncify state is "normal" and these fresh exported-function
+                // calls are safe), then the pending wait is woken.
+                private signalEvent() {
+                    this.eventPending = true;
+                    if (this.inputSignal !== null) {
+                        const resolve = this.inputSignal;
+                        this.inputSignal = null;
+                        resolve();
+                    }
+                }
+
+                onMessage(msg: any) {
                     // Print here because debug() is not set before first 'start' message
                     debug('Received from main:', msg);
 
                     switch (msg.kind) {
+                        case 'key':
+                            guiWasmHandleKeydown(msg.key, msg.keyCode, msg.ctrl, msg.shift, msg.alt, msg.meta);
+                            this.signalEvent();
+                            return;
+                        case 'resize':
+                            this.domWidth = msg.width;
+                            this.domHeight = msg.height;
+                            guiWasmResizeShell(msg.width, msg.height);
+                            this.signalEvent();
+                            return;
+                        case 'cmdline': {
+                            const success = guiWasmDoCmdline(msg.cmdline);
+                            this.sendMessage({ kind: 'cmdline:response', success });
+                            this.signalEvent();
+                            return;
+                        }
                         case 'start':
                             emscriptenRuntimeInitialized
                                 .then(() => this.start(msg))
@@ -229,35 +267,45 @@ const VimWasmLibrary = {
                     }
                     this.domWidth = msg.canvasDomWidth;
                     this.domHeight = msg.canvasDomHeight;
-                    this.buffer = msg.buffer;
                     this.perf = msg.perf;
 
                     const willPrepare = this.prepareFileSystem(msg.persistent, msg.dirs, msg.files, msg.fetchFiles);
 
-                    if (!msg.clipboard) {
-                        guiWasmSetClipAvail(false);
-                    }
+                    // System clipboard read requires a synchronous round-trip to the
+                    // main thread, which the non-SAB build does not support. Disable
+                    // it; Vim's internal registers still work.
+                    guiWasmSetClipAvail(false);
 
                     return willPrepare.then(() => this.main(msg.cmdArgs));
                 }
 
-                waitAndHandleEventFromMain(timeout: number | undefined): number {
-                    // Note: Should we use performance.now()?
-                    const start = Date.now();
-                    const status = this.waitForStatusChanged(timeout);
-                    let elapsed = 0;
-
-                    if (status === STATUS_NOT_SET) {
-                        elapsed = Date.now() - start;
-                        debug('No event happened after', timeout, 'ms timeout. Elapsed:', elapsed);
-                        return elapsed;
+                // Asyncify replacement for the old SharedArrayBuffer/Atomics.wait
+                // blocking wait. Returns a Promise; emscripten (ASYNCIFY_IMPORTS)
+                // suspends Vim's main loop until input arrives or the timeout fires.
+                // Input itself is applied in onMessage() (reentrantly, while
+                // suspended), so here we only need to wake up.
+                waitForEventAsync(timeout: number | undefined): Promise<number> {
+                    if (this.eventPending) {
+                        this.eventPending = false;
+                        return Promise.resolve(0);
                     }
-
-                    this.handleEvent(status);
-
-                    elapsed = Date.now() - start;
-                    debug('Event', statusName(status), status, 'was handled with ms', elapsed);
-                    return elapsed;
+                    const start = Date.now();
+                    return new Promise<number>(resolve => {
+                        let timer: ReturnType<typeof setTimeout> | null = null;
+                        const done = () => {
+                            if (timer !== null) {
+                                clearTimeout(timer);
+                                timer = null;
+                            }
+                            this.inputSignal = null;
+                            this.eventPending = false;
+                            resolve(Date.now() - start);
+                        };
+                        this.inputSignal = done;
+                        if (timeout !== undefined && timeout > 0) {
+                            timer = setTimeout(done, timeout);
+                        }
+                    });
                 }
 
                 exportFile(fullpath: string): boolean {
@@ -380,13 +428,12 @@ const VimWasmLibrary = {
                     return ptr;
                 }
 
-                private main(args: string[]) {
+                private main(args: string[]): Promise<void> {
                     this.started = true;
                     debug('Start main function() with args', args);
 
                     if (args.length === 0) {
-                        wasmMain(0, NULL);
-                        return;
+                        return wasmMain(0, NULL);
                     }
 
                     // First elment of argv is the program name "vim"
@@ -414,11 +461,12 @@ const VimWasmLibrary = {
                     const argvPtr = Module._malloc(argvBuf.byteLength);
                     Module.HEAPU8.set(new Uint8Array(argvBuf.buffer), argvPtr as number);
 
-                    wasmMain(args.length, argvPtr as number);
+                    const done = wasmMain(args.length, argvPtr as number);
 
                     // Note: These allocated memories will never be free()ed because they should be alive
                     // until wasm_main() returns. Currently it's OK because this worker is for one-shot Vim
                     // process execution.
+                    return done;
                 }
 
                 private preloadFiles(
@@ -427,7 +475,8 @@ const VimWasmLibrary = {
                 ): Promise<unknown> {
                     for (const fpath of Object.keys(files)) {
                         try {
-                            FS.writeFile(fpath, files[fpath], { flags: 'wx+' });
+                            // emscripten 3.1.x dropped the 'wx+' open mode; use 'w'.
+                            FS.writeFile(fpath, files[fpath], { flags: 'w' });
                         } catch (e) {
                             debug('Could not create file:', fpath, e);
                         }
@@ -448,7 +497,7 @@ const VimWasmLibrary = {
                                 })
                                 .then(text => {
                                     try {
-                                        FS.writeFile(path, text, { flags: 'wx+' });
+                                        FS.writeFile(path, text, { flags: 'w' });
                                         debug('Fetched file from', remotePath, 'to', path);
                                     } catch (e) {
                                         debug('Could not create file', path, 'fetched from', remotePath, e, text);
@@ -926,8 +975,15 @@ const VimWasmLibrary = {
     },
 
     // int vimwasm_wait_for_input(int);
+    // Async (Asyncify): Asyncify.handleAsync() unwinds the Wasm stack while the
+    // returned Promise is pending and rewinds with its resolved value, so the
+    // worker yields to its event loop instead of blocking on Atomics.wait against
+    // a SharedArrayBuffer. Must be listed in ASYNCIFY_IMPORTS at link time.
+    vimwasm_wait_for_event__deps: ['$Asyncify'],
     vimwasm_wait_for_event(timeout: number): number {
-        return VW.runtime.waitAndHandleEventFromMain(timeout > 0 ? timeout : undefined);
+        return Asyncify.handleAsync(function() {
+            return VW.runtime.waitForEventAsync(timeout > 0 ? timeout : undefined);
+        });
     },
 
     // int vimwasm_export_file(char *);
