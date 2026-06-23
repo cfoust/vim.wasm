@@ -82,6 +82,15 @@ const VimWasmLibrary = {
                 alt: boolean,
                 meta: boolean,
             ) => void;
+            let guiWasmHandleMouse: (
+                button: number,
+                x: number,
+                y: number,
+                repeated: number,
+                ctrl: boolean,
+                shift: boolean,
+                alt: boolean,
+            ) => void;
             let guiWasmHandleDrop: (p: string) => void;
             let guiWasmSetClipAvail: (a: boolean) => void;
             let guiWasmDoCmdline: (c: string) => boolean;
@@ -104,6 +113,15 @@ const VimWasmLibrary = {
                         'boolean', // shift
                         'boolean', // alt
                         'boolean', // meta
+                    ]);
+                    guiWasmHandleMouse = Module.cwrap('gui_wasm_handle_mouse', null, [
+                        'number', // int button (0 left,1 mid,2 right,3 release,4 wheel-down,5 wheel-up,6 drag)
+                        'number', // int x (canvas pixels)
+                        'number', // int y (canvas pixels)
+                        'number', // int repeated_click
+                        'boolean', // ctrl
+                        'boolean', // shift
+                        'boolean', // alt
                     ]);
                     guiWasmHandleDrop = Module.cwrap('gui_wasm_handle_drop', null, ['string' /* filepath */]);
                     guiWasmSetClipAvail = Module.cwrap('gui_wasm_set_clip_avail', null, ['boolean' /* avail */]);
@@ -212,6 +230,18 @@ const VimWasmLibrary = {
                     switch (msg.kind) {
                         case 'key':
                             guiWasmHandleKeydown(msg.key, msg.keyCode, msg.ctrl, msg.shift, msg.alt, msg.meta);
+                            this.signalEvent();
+                            return;
+                        case 'mouse':
+                            guiWasmHandleMouse(
+                                msg.button,
+                                msg.x,
+                                msg.y,
+                                msg.repeated ? 1 : 0,
+                                msg.ctrl,
+                                msg.shift,
+                                msg.alt,
+                            );
                             this.signalEvent();
                             return;
                         case 'resize':

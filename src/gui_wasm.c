@@ -2181,6 +2181,49 @@ gui_wasm_handle_keydown(
     add_to_input_buf(input, len);
 }
 
+/*
+ * Forward a mouse event from the browser to Vim. Coordinates are in canvas
+ * pixels (already scaled by devicePixelRatio on the JS side, matching the
+ * pixel space gui_resize_shell()/gui.char_width work in). The `button` code is
+ * a small JS-side enum, mapped here to Vim's MOUSE_* constants:
+ *   0 left  1 middle  2 right  3 release  4 wheel-down  5 wheel-up  6 drag
+ */
+void
+gui_wasm_handle_mouse(
+    int button,
+    int x,
+    int y,
+    int repeated_click,
+    int const ctrl,
+    int const shift,
+    int const alt)
+{
+    int vim_button;
+    int_u modifiers = 0;
+
+    switch (button) {
+        case 0: vim_button = MOUSE_LEFT; break;
+        case 1: vim_button = MOUSE_MIDDLE; break;
+        case 2: vim_button = MOUSE_RIGHT; break;
+        case 3: vim_button = MOUSE_RELEASE; break;
+        case 4: vim_button = MOUSE_4; break;   // wheel scrolls text down
+        case 5: vim_button = MOUSE_5; break;   // wheel scrolls text up
+        case 6: vim_button = MOUSE_DRAG; break;
+        default: return;
+    }
+
+    if (shift) modifiers |= MOUSE_SHIFT;
+    if (ctrl)  modifiers |= MOUSE_CTRL;
+    if (alt)   modifiers |= MOUSE_ALT;
+
+    GUI_WASM_DBG("gui_wasm_handle_mouse: button=%d x=%d y=%d rep=%d mod=%x",
+        button, x, y, repeated_click, modifiers);
+
+    // Queues the event into Vim's input buffer; the suspended main loop is
+    // woken by the worker's signalEvent() after this returns.
+    gui_send_mouse_event(vim_button, x, y, repeated_click, modifiers);
+}
+
 void
 gui_wasm_resize_shell(int pixel_width, int pixel_height)
 {

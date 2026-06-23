@@ -142,6 +142,20 @@ export class VimWorker {
         this.worker.postMessage({ kind: 'resize', width, height });
     }
 
+    // button: 0 left, 1 middle, 2 right, 3 release, 4 wheel-down, 5 wheel-up, 6 drag.
+    // x/y are canvas-relative CSS pixels (Vim's GUI coordinate space).
+    notifyMouseEvent(
+        button: number,
+        x: number,
+        y: number,
+        repeated: boolean,
+        ctrl: boolean,
+        shift: boolean,
+        alt: boolean,
+    ) {
+        this.worker.postMessage({ kind: 'mouse', button, x, y, repeated, ctrl, shift, alt });
+    }
+
     // Reply to a read-clipboard:request with the system clipboard text (or null
     // on failure). Resolves the worker's awaited vimwasm_read_clipboard().
     sendClipboardText(text: string | null) {
@@ -499,6 +513,16 @@ export class ScreenCanvas implements DrawEventHandler, ScreenDrawer {
     private spColor: string;
     private fontName: string;
     private rafScheduled: boolean;
+    // currently pressed mouse button (Vim button code), or -1 when none is down
+    private mouseButton: number;
+    // accumulated wheel delta so trackpad/high-res wheels step by whole lines
+    private wheelAccumX: number;
+    private wheelAccumY: number;
+    private onMousedown: (e: MouseEvent) => void;
+    private onMousemove: (e: MouseEvent) => void;
+    private onMouseup: (e: MouseEvent) => void;
+    private onWheel: (e: WheelEvent) => void;
+    private onContextmenu: (e: MouseEvent) => void;
     // Note: BG color is actually unused because color information is included
     // in drawRect event arguments
     // private bgColor: string;
@@ -517,10 +541,21 @@ export class ScreenCanvas implements DrawEventHandler, ScreenDrawer {
         const res = window.devicePixelRatio || 1;
         this.canvas.width = rect.width * res;
         this.canvas.height = rect.height * res;
-        this.canvas.addEventListener('click', this.onClick.bind(this), {
-            capture: true,
-            passive: true,
-        });
+        this.onMousedown = this.handleMousedown.bind(this);
+        this.onMousemove = this.handleMousemove.bind(this);
+        this.onMouseup = this.handleMouseup.bind(this);
+        this.onWheel = this.handleWheel.bind(this);
+        this.onContextmenu = this.handleContextmenu.bind(this);
+        this.mouseButton = -1;
+        this.wheelAccumX = 0;
+        this.wheelAccumY = 0;
+        this.canvas.addEventListener('mousedown', this.onMousedown);
+        this.canvas.addEventListener('mousemove', this.onMousemove);
+        // mouseup/mousemove are tracked on window so a drag that leaves the
+        // canvas still reports moves and the release is never missed.
+        window.addEventListener('mouseup', this.onMouseup);
+        this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+        this.canvas.addEventListener('contextmenu', this.onContextmenu);
 
         this.input = new InputHandler(this.worker, input);
         this.resizer = new ResizeHandler(rect.width, rect.height, canvas, worker);
@@ -705,8 +740,92 @@ export class ScreenCanvas implements DrawEventHandler, ScreenDrawer {
         this.ctx.drawImage(this.canvas, x, sy, w, h, x, dy, w, h);
     }
 
-    private onClick() {
+    // Map a DOM MouseEvent.button (0 left, 1 middle, 2 right) to Vim's button
+    // code, or -1 for buttons Vim doesn't handle here.
+    private domButtonToVim(button: number): number {
+        switch (button) {
+            case 0: return 0; // left
+            case 1: return 1; // middle
+            case 2: return 2; // right
+            default: return -1;
+        }
+    }
+
+    // Canvas-relative position in CSS pixels (Vim's GUI coordinate space).
+    private mousePos(e: MouseEvent): { x: number; y: number } {
+        const rect = this.canvas.getBoundingClientRect();
+        return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    }
+
+    private handleMousedown(e: MouseEvent) {
         this.input.focus();
+        const button = this.domButtonToVim(e.button);
+        if (button < 0) {
+            return;
+        }
+        e.preventDefault();
+        this.mouseButton = button;
+        const { x, y } = this.mousePos(e);
+        // e.detail is the consecutive-click count (2 = double, 3 = triple),
+        // which Vim uses for word/line selection on repeated clicks.
+        this.worker.notifyMouseEvent(button, x, y, e.detail >= 2, e.ctrlKey, e.shiftKey, e.altKey);
+    }
+
+    private handleMousemove(e: MouseEvent) {
+        if (this.mouseButton < 0) {
+            return; // only forward moves while a button is held (a drag)
+        }
+        const { x, y } = this.mousePos(e);
+        this.worker.notifyMouseEvent(6 /* drag */, x, y, false, e.ctrlKey, e.shiftKey, e.altKey);
+    }
+
+    private handleMouseup(e: MouseEvent) {
+        if (this.mouseButton < 0) {
+            return;
+        }
+        this.mouseButton = -1;
+        const { x, y } = this.mousePos(e);
+        this.worker.notifyMouseEvent(3 /* release */, x, y, false, e.ctrlKey, e.shiftKey, e.altKey);
+    }
+
+    private handleWheel(e: WheelEvent) {
+        e.preventDefault();
+        // Normalize the delta to pixels regardless of the browser's reporting
+        // mode (0=pixel, 1=line, 2=page), then accumulate so trackpads (many
+        // tiny deltas) and notched wheels (one ~120px step) both scroll evenly.
+        const LINE_PX = 16;
+        const PAGE_PX = 400;
+        const STEP_PX = 120; // one Vim wheel event (~3 lines) per notch
+        const MAX_EVENTS = 6; // clamp a single delta so it can't fly to EOF
+        const scale = e.deltaMode === 1 ? LINE_PX : e.deltaMode === 2 ? PAGE_PX : 1;
+        this.wheelAccumY += e.deltaY * scale;
+
+        const { x, y } = this.mousePos(e);
+
+        // Vim's wheel constants are inverted on purpose: MOUSE_5 ("wheel up")
+        // moves the window DOWN, MOUSE_4 ("wheel down") moves it UP. So a
+        // physical scroll-down (deltaY > 0, show later lines) maps to button 5.
+        let n = 0;
+        while (this.wheelAccumY >= STEP_PX && n < MAX_EVENTS) {
+            this.wheelAccumY -= STEP_PX;
+            n++;
+            this.worker.notifyMouseEvent(5 /* window moves down */, x, y, false, e.ctrlKey, e.shiftKey, e.altKey);
+        }
+        while (this.wheelAccumY <= -STEP_PX && n < MAX_EVENTS) {
+            this.wheelAccumY += STEP_PX;
+            n++;
+            this.worker.notifyMouseEvent(4 /* window moves up */, x, y, false, e.ctrlKey, e.shiftKey, e.altKey);
+        }
+        // drop leftover once we hit the clamp so a fast flick doesn't queue up
+        if (n >= MAX_EVENTS) {
+            this.wheelAccumY = 0;
+        }
+    }
+
+    private handleContextmenu(e: MouseEvent) {
+        // Suppress the browser menu so right-click reaches Vim (e.g. for the
+        // popup 'mousemodel' or right-drag selection).
+        e.preventDefault();
     }
 
     private onAnimationFrame() {
