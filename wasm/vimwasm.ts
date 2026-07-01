@@ -456,6 +456,15 @@ export class InputHandler {
         const alt = event.altKey;
         const meta = event.metaKey;
 
+        // macOS Cmd+V: Vim is built without USE_CMD_KEY, so the Cmd modifier
+        // never reaches Vim and Cmd+V would insert a bare "v". Translate it
+        // into a synthetic <F13>, which the editor's vimrc maps to a
+        // mode-correct system-clipboard paste.
+        if (meta && !ctrl && !alt && (key === 'v' || key === 'V')) {
+            this.worker.notifyKeyEvent('F13', 124, false, false, false, false);
+            return;
+        }
+
         if (key.length > 1) {
             if (
                 key === 'Unidentified' ||

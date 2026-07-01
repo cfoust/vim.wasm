@@ -407,7 +407,11 @@
  * VIMINFO_FILE		Location of user .viminfo file (should start with $).
  * VIMINFO_FILE2	Location of alternate user .viminfo file.
  */
-#if defined(FEAT_NORMAL) && !defined(FEAT_GUI_WASM)
+// Upstream vim.wasm disables viminfo (&& !defined(FEAT_GUI_WASM)) because its
+// filesystem is in-memory and wiped each run. wasmavi mounts ~/.persist as
+// IDBFS (see frontend/vimwasm_frame.ts), so viminfo now survives across
+// sessions and is worth enabling.
+#if defined(FEAT_NORMAL)
 # define FEAT_VIMINFO
 // #define VIMINFO_FILE	"$HOME/foo/.viminfo"
 // #define VIMINFO_FILE2 "~/bar/.viminfo"
